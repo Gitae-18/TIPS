@@ -16,7 +16,7 @@ class MetadataEnvelope:
 class JpegFrame:
     frame_index: int
     ts: float
-    jpeg_bytes: bytes
+    jpeg_bytes: bytes | None = None
     width: int | None = None
     height: int | None = None
     frame_metadata: dict[str, Any] | None = None

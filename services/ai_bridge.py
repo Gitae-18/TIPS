@@ -78,25 +78,27 @@ class AiBridge:
 
     def record_jpeg_frame(self, frame: JpegFrame) -> None:
         batch_payload: dict | None = None
+        topic: str | None = None
         with self._frame_lock:
-            self._pending_frames.append(
-                {
-                    "frame_index": frame.frame_index,
-                    "frame_name": f"frame_{frame.frame_index:06d}.jpg",
-                    "timestamp_epoch": frame.ts,
-                    "image_jpeg_b64": base64.b64encode(frame.jpeg_bytes).decode("ascii"),
-                    "width": frame.width,
-                    "height": frame.height,
-                    "frame_metadata": deepcopy(frame.frame_metadata),
-                    "ai_metadata": deepcopy(self._latest_ai_payload),
-                }
-            )
+            frame_payload = {
+                "frame_index": frame.frame_index,
+                "frame_name": f"frame_{frame.frame_index:06d}.jpg",
+                "timestamp_epoch": frame.ts,
+                "width": frame.width,
+                "height": frame.height,
+                "frame_metadata": deepcopy(frame.frame_metadata),
+                "ai_metadata": deepcopy(self._latest_ai_payload),
+            }
+            if frame.jpeg_bytes is not None:
+                frame_payload["image_jpeg_b64"] = base64.b64encode(frame.jpeg_bytes).decode("ascii")
+            self._pending_frames.append(frame_payload)
             if len(self._pending_frames) < self.config.video.frame_batch_size:
                 return
 
             self._frame_batch_index += 1
             frames = self._pending_frames
             self._pending_frames = []
+            has_images = any("image_jpeg_b64" in item for item in frames)
             batch_payload = {
                 "batch_id": f"{self.config.video.camera_id}-{self._frame_batch_index:06d}",
                 "batch_index": self._frame_batch_index,
@@ -105,11 +107,13 @@ class AiBridge:
                 "count": len(frames),
                 "start_ts": frames[0]["timestamp_epoch"],
                 "end_ts": frames[-1]["timestamp_epoch"],
+                "video_transport": "rtsp" if not has_images and self.config.video.frame_source.strip().lower() == "replay" else "mqtt",
+                "rtsp_url": self.config.video.rtsp_publish_url if not has_images else None,
                 "frames": frames,
             }
+            topic = self._frame_batch_topic(has_images)
 
-        if batch_payload is not None:
-            topic = f"{self.config.metadata.mqtt_topic_prefix}/frames/jpeg/batch"
+        if batch_payload is not None and topic is not None:
             self.metadata_publisher.publish(topic, batch_payload)
 
     def start_event(self, decision: AiDecision, recording: RecordingSession | None) -> str:
@@ -177,6 +181,7 @@ class AiBridge:
             self._frame_batch_index += 1
             frames = self._pending_frames
             self._pending_frames = []
+            has_images = any("image_jpeg_b64" in item for item in frames)
 
         payload = {
             "batch_id": f"{self.config.video.camera_id}-{self._frame_batch_index:06d}",
@@ -186,10 +191,18 @@ class AiBridge:
             "count": len(frames),
             "start_ts": frames[0]["timestamp_epoch"],
             "end_ts": frames[-1]["timestamp_epoch"],
+            "video_transport": "rtsp" if not has_images and self.config.video.frame_source.strip().lower() == "replay" else "mqtt",
+            "rtsp_url": self.config.video.rtsp_publish_url if not has_images else None,
             "frames": frames,
         }
-        topic = f"{self.config.metadata.mqtt_topic_prefix}/frames/jpeg/batch"
+        topic = self._frame_batch_topic(has_images)
         self.metadata_publisher.publish(topic, payload)
+
+    def _frame_batch_topic(self, has_images: bool) -> str:
+        if has_images:
+            return f"{self.config.metadata.mqtt_topic_prefix}/frames/jpeg/batch"
+        suffix = self.config.video.replay_metadata_topic.strip("/") or "frames/metadata/batch"
+        return f"{self.config.metadata.mqtt_topic_prefix}/{suffix}"
 
 
 def build_default_bridge(config: BridgeConfig) -> AiBridge:

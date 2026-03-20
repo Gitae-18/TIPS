@@ -148,7 +148,7 @@ class RtspJpegFramePublisher(threading.Thread, BaseFramePublisher):
             self._proc = None
 
 
-class LocalReplayFramePublisher(threading.Thread, BaseFramePublisher):
+class ReplayRtspMetadataPublisher(threading.Thread, BaseFramePublisher):
     def __init__(
         self,
         config: VideoConfig,
@@ -160,53 +160,104 @@ class LocalReplayFramePublisher(threading.Thread, BaseFramePublisher):
         self.on_frame = on_frame
         self.on_complete = on_complete
         self.stop_evt = threading.Event()
+        self._proc: subprocess.Popen | None = None
+        self._is_windows = platform.system().lower().startswith("win")
 
     def stop(self) -> None:
         self.stop_evt.set()
+        self._stop_process()
 
     def run(self) -> None:
         frames_dir = Path(self.config.replay_frames_dir)
         metadata_dir = Path(self.config.replay_metadata_dir)
-        frame_paths = sorted(frames_dir.glob("*.jpg"))[: self.config.replay_max_frames]
+        frame_paths = sorted(frames_dir.glob("frame_*.jpg"))
+        if self.config.replay_max_frames > 0:
+            frame_paths = frame_paths[: self.config.replay_max_frames]
         if not frame_paths:
             log("FRAME", f"REPLAY START FAIL no jpg files in {frames_dir}")
-            if self.on_complete is not None:
-                self.on_complete()
+            self._notify_complete()
             return
 
         period = 1.0 / max(0.1, self.config.replay_fps)
         base_ts = time.time()
-        log(
-            "FRAME",
-            f"REPLAY START fps={self.config.replay_fps} max_frames={len(frame_paths)} dir={frames_dir}",
-        )
+        max_frames = len(frame_paths)
 
         try:
+            self._start_rtsp_stream(frame_paths[0], max_frames)
+            log(
+                "FRAME",
+                f"REPLAY RTSP START fps={self.config.replay_fps} codec={self.config.replay_rtsp_codec} "
+                f"max_frames={max_frames} url={self.config.rtsp_publish_url}",
+            )
             for sequence_index, frame_path in enumerate(frame_paths, start=1):
                 if self.stop_evt.is_set():
                     break
 
                 metadata = self._load_frame_metadata(metadata_dir, frame_path.stem)
-                frame_index = self._frame_index_from_name(frame_path.stem, sequence_index)
+                frame_index = self._frame_index_from_name(frame_path.stem, sequence_index - 1)
                 frame_ts = base_ts + self._metadata_offset_sec(metadata, sequence_index, period)
-                with frame_path.open("rb") as fp:
-                    jpeg_bytes = fp.read()
-
                 self.on_frame(
                     JpegFrame(
                         frame_index=frame_index,
                         ts=frame_ts,
-                        jpeg_bytes=jpeg_bytes,
                         frame_metadata=metadata,
                     )
                 )
-
                 if self.stop_evt.wait(period):
                     break
         finally:
-            log("FRAME", "REPLAY STOPPED")
-            if self.on_complete is not None:
-                self.on_complete()
+            self._stop_process()
+            log("FRAME", "REPLAY RTSP STOPPED")
+            self._notify_complete()
+
+    def _start_rtsp_stream(self, first_frame_path: Path, max_frames: int) -> None:
+        pattern = str(first_frame_path.parent / "frame_%06d.jpg")
+        codec_name = self._codec_name()
+        cmd = [
+            self.config.ffmpeg_bin,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-re",
+            "-framerate",
+            str(self.config.replay_fps),
+            "-start_number",
+            str(self._frame_index_from_name(first_frame_path.stem, 0)),
+            "-i",
+            pattern,
+            "-vframes",
+            str(max_frames),
+            "-an",
+            "-c:v",
+            codec_name,
+            "-preset",
+            self.config.replay_rtsp_preset,
+            "-pix_fmt",
+            self.config.replay_rtsp_pixel_format,
+            "-tune",
+            "zerolatency",
+            "-f",
+            "rtsp",
+            self.config.rtsp_publish_url,
+        ]
+
+        popen_kwargs: dict[str, object] = {
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.PIPE,
+            "text": True,
+        }
+        if self._is_windows:
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs["preexec_fn"] = os.setsid
+
+        self._proc = subprocess.Popen(cmd, **popen_kwargs)
+
+    def _codec_name(self) -> str:
+        codec = self.config.replay_rtsp_codec.strip().lower()
+        if codec in {"h265", "hevc", "libx265"}:
+            return "libx265"
+        return "libx264"
 
     def _load_frame_metadata(self, metadata_dir: Path, frame_stem: str) -> dict | None:
         metadata_path = metadata_dir / f"{frame_stem}.json"
@@ -223,7 +274,6 @@ class LocalReplayFramePublisher(threading.Thread, BaseFramePublisher):
     def _metadata_offset_sec(self, metadata: dict | None, frame_index: int, period: float) -> float:
         if metadata is None:
             return (frame_index - 1) * period
-
         try:
             return float(metadata.get("timestamp_sec", (frame_index - 1) * period))
         except Exception:
@@ -237,6 +287,32 @@ class LocalReplayFramePublisher(threading.Thread, BaseFramePublisher):
         except Exception:
             return fallback_index
 
+    def _stop_process(self) -> None:
+        if self._proc is None or self._proc.poll() is not None:
+            self._proc = None
+            return
+
+        try:
+            if self._is_windows:
+                self._proc.send_signal(signal.CTRL_BREAK_EVENT)
+            else:
+                os.killpg(os.getpgid(self._proc.pid), signal.SIGINT)
+            self._proc.wait(timeout=3.0)
+        except Exception:
+            try:
+                if self._is_windows:
+                    self._proc.kill()
+                else:
+                    os.killpg(os.getpgid(self._proc.pid), signal.SIGKILL)
+            except Exception:
+                pass
+        finally:
+            self._proc = None
+
+    def _notify_complete(self) -> None:
+        if self.on_complete is not None:
+            self.on_complete()
+
 
 def build_frame_publisher(
     config: VideoConfig,
@@ -245,5 +321,5 @@ def build_frame_publisher(
 ) -> BaseFramePublisher:
     source = config.frame_source.strip().lower()
     if source == "replay":
-        return LocalReplayFramePublisher(config, on_frame, on_complete=on_complete)
+        return ReplayRtspMetadataPublisher(config, on_frame, on_complete=on_complete)
     return RtspJpegFramePublisher(config, on_frame)
